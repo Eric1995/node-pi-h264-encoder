@@ -5,9 +5,6 @@
             "sources": ["cpp/index.cpp"],
             "include_dirs": [
                 "<!@(node -p \"require('node-addon-api').include\")",
-                "/usr/local/include/libcamera",
-                "/usr/include/libcamera",
-                "/home/eric/Dev/node-libcamera/include",
                 "/usr/aarch64-linux-gnu/include",
             ],
             "dependencies": [

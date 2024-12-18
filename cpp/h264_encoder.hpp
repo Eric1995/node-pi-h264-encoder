@@ -3,7 +3,6 @@
 #include <condition_variable>
 #include <fcntl.h>
 #include <iostream>
-#include <libcamera/libcamera.h>
 #include <linux/videodev2.h>
 #include <mutex>
 #include <napi.h>
