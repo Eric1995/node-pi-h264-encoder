@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "target": "ESNext",
+    "moduleResolution": "node",
+    "emitDeclarationOnly": true,
+    "allowSyntheticDefaultImports": true,
+    "lib": ["ESNext"],
+    "resolveJsonModule": true,
+    "strictNullChecks": true,
+    "declaration": true,
+    "outDir": "dist/types",
+    "skipLibCheck": true,
+    
+  },
+  "include": ["src"],
+}

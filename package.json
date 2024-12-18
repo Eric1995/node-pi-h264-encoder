@@ -1,0 +1,44 @@
+{
+  "name": "node-pi-h264-encoder",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/lib/index.js",
+  "module": "dist/es/index.js",
+  "type": "module",
+  "scripts": {
+    "configure": "node-gyp configure --arch=arm64",
+    "build": "node-gyp build --arch=arm64",
+    "esbuild": "tsx ./esbuild.config.ts"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/es/index.js",
+      "require": "./dist/lib/index.js",
+      "types": "./dist/es/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "binding.gyp"
+  ],
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/bindings": "^1.5.5",
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^22.10.2",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "bindings": "^1.5.0",
+    "esbuild": "^0.24.0",
+    "eslint-define-config": "^2.1.0",
+    "eslint-plugin-simple-import-sort": "^10.0.0",
+    "fs-extra": "^11.2.0",
+    "node-addon-api": "^8.3.0",
+    "node-gyp": "^11.0.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
