@@ -6,8 +6,10 @@
   "module": "dist/es/index.js",
   "type": "module",
   "scripts": {
-    "configure": "node-gyp configure --arch=arm64",
-    "build": "node-gyp build --arch=arm64",
+    "clean": "node-gyp clean",
+    "config_shell": "npm config set script-shell \"/bin/bash\";",
+    "configure": "npm run config_shell; source ./env.sh; node-gyp configure --arch=arm64",
+    "build": "npm run config_shell; source ./env.sh; node-gyp build --arch=arm64",
     "esbuild": "tsx ./esbuild.config.ts"
   },
   "exports": {
