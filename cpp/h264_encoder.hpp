@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <linux/videodev2.h>
+#include <list>
 #include <mutex>
 #include <napi.h>
 #include <optional>
@@ -25,6 +26,14 @@ struct frame_data_t
     uint8_t *data;
 };
 
+struct pending_frame_t
+{
+    // For V4L2_MEMORY_DMABUF
+    int fd = -1;
+    // For V4L2_MEMORY_MMAP
+    std::vector<uint8_t> data;
+    uint32_t size;
+};
 using FrameType = frame_data_t *;
 
 struct buffer
@@ -84,6 +93,12 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     FILE *file = NULL;
     bool stopped = false;
 
+    // Thread-safe queue for incoming frames
+    std::mutex queue_mtx;
+    std::condition_variable queue_cv;
+    std::list<pending_frame_t> frame_queue;
+    bool first_frame_fed = false;
+
     bool invoke_callback = true;
     uint32_t total_frame = 0;
     uint32_t total_size = 0;
@@ -99,8 +114,9 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
      */
     uint8_t feed_type = 1;
 
-    EncoderWorker(Napi::Object option, Napi::Function callback) : AsyncProgressWorker(callback)
+    EncoderWorker(Napi::Object option, Napi::Function callback) : AsyncProgressWorker(callback), queue_mtx(), queue_cv(), frame_queue()
     {
+        // The rest of the constructor logic
         // Defer opening and configuring the device until Execute,
         // so that errors can be reported via OnError.
         // But we can do some pre-checks here.
@@ -298,6 +314,8 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         }
     }
 
+    ~EncoderWorker() override = default;
+
     void Execute(const ExecutionProgress &progress)
     {
         if (!init_error_msg.empty())
@@ -306,6 +324,39 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             return;
         }
 
+        // The main loop starts here. First, we need to wait for the very first frame
+        // to be fed from the JS side.
+        {
+            std::unique_lock<std::mutex> lock(queue_mtx);
+            // Wait until the queue is not empty or the worker is stopped.
+            queue_cv.wait(lock, [this] { return stopped || !frame_queue.empty(); });
+
+            if (stopped)
+                return;
+
+            // Dequeue the first frame and feed it to the hardware.
+            pending_frame_t frame = std::move(frame_queue.front());
+            frame_queue.pop_front();
+            first_frame_fed = true;
+            lock.unlock();
+
+            try
+            {
+                if (feed_type == 1)
+                {
+                    feed_to_v4l2(frame.fd, frame.size);
+                }
+                else
+                {
+                    feed_to_v4l2(frame.data.data(), frame.size);
+                }
+            }
+            catch (const std::runtime_error &e)
+            {
+                SetError(e.what());
+                return;
+            }
+        }
         while (true)
         {
             if (stopped)
@@ -340,6 +391,41 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
                     // This can happen if we are stopping, so don't treat as a fatal error
                     // SetError("failed to dequeue output buffer");
                     // break;
+                }
+                else
+                {
+                    // The previous frame has been processed. Now feed the next one from our queue.
+                    std::unique_lock<std::mutex> lock(queue_mtx);
+                    // Wait until there is a new frame in the queue or we are stopped.
+                    queue_cv.wait(lock, [this] { return stopped || !frame_queue.empty(); });
+
+                    if (stopped)
+                    {
+                        lock.unlock();
+                        break;
+                    }
+
+                    // Dequeue the next frame and feed it.
+                    pending_frame_t frame = std::move(frame_queue.front());
+                    frame_queue.pop_front();
+                    lock.unlock();
+
+                    try
+                    {
+                        if (feed_type == 1)
+                        {
+                            feed_to_v4l2(frame.fd, frame.size);
+                        }
+                        else
+                        {
+                            feed_to_v4l2(frame.data.data(), frame.size);
+                        }
+                    }
+                    catch (const std::runtime_error &e)
+                    {
+                        SetError(e.what());
+                        break;
+                    }
                 }
                 // 将capture buffer出列
                 buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -388,21 +474,18 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         }
     }
 
-    void feed(uint8_t *plane_data, uint32_t size)
+    void feed_to_v4l2(const uint8_t *plane_data, uint32_t size)
     {
-        // uint32_t size = data.Get("size").As<Napi::Number>().Uint32Value();
-        // uint8_t *plane_data = (uint8_t *)data.Get("data").As<Napi::ArrayBuffer>().Data();
         memcpy(output.start, plane_data, size);
-        if (ioctl(fd, VIDIOC_QBUF, output.inner) < 0)
+        struct v4l2_buffer *buf_to_queue = &output.inner;
+        if (ioctl(fd, VIDIOC_QBUF, buf_to_queue) < 0)
         {
-            Napi::Error::New(Env(), "failed to queue output buffer").ThrowAsJavaScriptException();
+            throw std::runtime_error(std::string("failed to queue output buffer: ") + std::strerror(errno));
         }
     }
 
-    void feed(int _fd, uint32_t size)
+    void feed_to_v4l2(int _fd, uint32_t size)
     {
-        if (stopped)
-            return;
         v4l2_buffer buf = {};
         v4l2_plane planes[VIDEO_MAX_PLANES] = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -416,11 +499,37 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         buf.m.planes[0].length = size;
         if (ioctl(fd, VIDIOC_QBUF, &buf) < 0)
         {
-            Napi::Error::New(Env(), std::string("failed to queue dma buffer: ") + std::strerror(errno)).ThrowAsJavaScriptException();
-            return;
+            if (_fd != -1)
+                close(_fd);
+            throw std::runtime_error(std::string("failed to queue dma buffer: ") + std::strerror(errno));
         }
         feed_time = millis();
-        // std::cout << fd << "--feed frame: " << total_frame << " at: " << feed_time << std::endl;
+    }
+
+    void feed(uint8_t *plane_data, uint32_t size)
+    {
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            // For MMAP, we must copy the data as the source buffer might be reused.
+            frame_queue.push_back({-1, std::vector<uint8_t>(plane_data, plane_data + size), size});
+        }
+        // Notify the worker thread that a new frame is available.
+        queue_cv.notify_one();
+    }
+
+    void feed(int _fd, uint32_t size)
+    {
+        if (stopped)
+        {
+            close(_fd); // Prevent fd leak if stopped
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            frame_queue.push_back({_fd, {}, size});
+        }
+        // Notify the worker thread that a new frame is available.
+        queue_cv.notify_one();
     }
 
     int setController(Napi::Object ctrl_obj)
@@ -441,6 +550,18 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             return;
         }
         stopped = true;
+
+        // Clear any pending frame
+        queue_cv.notify_one(); // Wake up the worker thread if it's waiting
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            for (const auto &frame : frame_queue)
+            {
+                if (frame.fd != -1)
+                    close(frame.fd);
+            }
+            frame_queue.clear();
+        }
 
         // Unmap buffers
         munmap(capture.start, capture.length);
@@ -600,26 +721,34 @@ class H264Encoder : public Napi::ObjectWrap<H264Encoder>
         if (!worker->init_error_msg.empty())
         {
             std::string errMsg = worker->init_error_msg;
-            delete worker; // Prevent memory leak on initialization failure
+            // The worker will be deleted by the ObjectWrap finalizer.
             worker = nullptr;
-            Napi::Error::New(info.Env(), worker->init_error_msg).ThrowAsJavaScriptException();
+            Napi::Error::New(info.Env(), errMsg).ThrowAsJavaScriptException();
             return;
         }
         worker->Queue();
     }
     Napi::Value feed(const Napi::CallbackInfo &info)
     {
-        Napi::Value param = info[0].As<Napi::Value>();
-        if (param.IsArrayBuffer())
+        Napi::Env env = info.Env();
+        try
         {
-            uint8_t *plane_data = (uint8_t *)param.As<Napi::ArrayBuffer>().Data();
-            worker->feed(plane_data, info[1].As<Napi::Number>().Uint32Value());
+            Napi::Value param = info[0].As<Napi::Value>();
+            if (param.IsArrayBuffer())
+            {
+                uint8_t *plane_data = (uint8_t *)param.As<Napi::ArrayBuffer>().Data();
+                worker->feed(plane_data, info[1].As<Napi::Number>().Uint32Value());
+            }
+            else if (param.IsNumber())
+            {
+                worker->feed(param.As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().Uint32Value());
+            }
         }
-        else if (param.IsNumber())
+        catch (const std::runtime_error &e)
         {
-            worker->feed(param.As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().Uint32Value());
+            Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+            return env.Undefined();
         }
-
         return Napi::Number::New(info.Env(), 0);
     }
 
