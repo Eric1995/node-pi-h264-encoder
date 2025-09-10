@@ -15,11 +15,8 @@ esbuild.buildSync({
   tsconfig: './tsconfig.json',
   target: 'ESNext',
   external: ['../build/Release/h264.node'],
-  banner: {
-    js: `
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-    `,
+  outExtension: {
+    '.js': '.mjs',
   },
 });
 
@@ -32,18 +29,21 @@ esbuild.buildSync({
   tsconfig: './tsconfig.json',
   target: 'ESNext',
   external: ['../build/Release/h264.node'],
+  outExtension: {
+    '.js': '.cjs',
+  },
 });
 
 try {
-  execSync(`tsc --emitDeclarationOnly --declaration --project tsconfig.json --outDir ${outputPath}/types`);
+  execSync(`tsc --emitDeclarationOnly --declaration --project tsconfig.json --outDir ${outputPath}/types_tmp`);
 } catch (error) {
   console.error(error.stdout.toString());
 }
-
-fs.copySync(`${outputPath}/types`, `${outputPath}/es`);
+fs.ensureDirSync(`${outputPath}/types`);
+fs.copySync(`${outputPath}/types_tmp`, `${outputPath}/types`);
 // fs.copySync(`${outputPath}/types/src`, `${outputPath}/lib`);
-fs.rmSync(`${outputPath}/types`, { recursive: true });
+fs.rmSync(`${outputPath}/types_tmp`, { recursive: true });
 
-if (fs.existsSync('build/Release/h264.node')) {
-  fs.copySync(`build/Release/h264.node`, `${outputPath}/build/Release/h264.node`);
+if (fs.existsSync('build/Release/encoder.node')) {
+  fs.copySync(`build/Release/encoder.node`, `${outputPath}/build/Release/encoder.node`);
 }

@@ -1,4 +1,6 @@
+import { createRequire } from 'module';
 import type { EncoderInputType, EncoderOption, RawH264Encoder, RawH264EncoderConstructor } from './types';
+const require = createRequire(import.meta?.url ?? __filename);
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { H264Encoder: _H264Encoder } = require('../build/Release/h264.node') as {
