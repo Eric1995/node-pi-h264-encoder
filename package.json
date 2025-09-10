@@ -7,16 +7,17 @@
   "type": "module",
   "scripts": {
     "clean": "node-gyp clean",
-    "config_shell": "npm config set script-shell \"/bin/bash\";",
-    "configure": "npm run config_shell; source ./env.sh; node-gyp configure --arch=arm64",
-    "build": "npm run config_shell; source ./env.sh; node-gyp build --arch=arm64",
+    "configure": "CC=clang CXX=clang++ node-gyp configure --arch=arm64",
+    "build": "CC=clang CXX=clang++ node-gyp build --arch=arm64",
+    "configure:arm64": "CC=clang CXX=clang++ FLAG=CROSS TARGET_ARCH=arm64 node-gyp configure --arch=arm64",
+    "build:arm64": "CC=clang CXX=clang++ FLAG=CROSS TARGET_ARCH=arm64 node-gyp build --arch=arm64",
     "esbuild": "tsx ./esbuild.config.ts"
   },
   "exports": {
     ".": {
-      "import": "./dist/es/index.js",
-      "require": "./dist/lib/index.js",
-      "types": "./dist/es/index.d.ts"
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/es/index.mjs",
+      "require": "./dist/lib/index.cjs"
     }
   },
   "files": [
