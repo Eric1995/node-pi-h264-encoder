@@ -83,8 +83,6 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     int fd;
     FILE *file = NULL;
     bool stopped = false;
-    std::mutex mtx; // 互斥量，保护产品缓冲区
-    std::condition_variable frame_available;
 
     bool invoke_callback = true;
     uint32_t total_frame = 0;
@@ -148,11 +146,11 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         if (option.Get("controllers").IsArray())
         {
             Napi::Array controllers = option.Get("controllers").As<Napi::Array>();
-            for (int i = 0; i < controllers.Length(); i++)
+            for (uint32_t i = 0; i < controllers.Length(); i++)
             {
                 Napi::Object ctrl_obj = controllers.Get(i).As<Napi::Object>();
-                uint32_t id = ctrl_obj.Get('id').As<Napi::Number>().Uint32Value();
-                int32_t value = ctrl_obj.Get('value').As<Napi::Number>().Int32Value();
+                uint32_t id = ctrl_obj.Get("id").As<Napi::Number>().Uint32Value();
+                int32_t value = ctrl_obj.Get("value").As<Napi::Number>().Int32Value();
                 v4l2_control ctrl = {};
                 ctrl.id = id;
                 ctrl.value = value;
@@ -358,7 +356,7 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
                 uint32_t encoded_len = buf.m.planes[0].bytesused;
                 if (encoded_len > 0)
                 {
-                    long long current = millis();
+                    // long long current = millis();
                     // std::cout << fd << "--encoded frame: " << total_frame << " cost: " << current - feed_time << ", size: " << encoded_len / 1024.0 << std::endl;
                     total_frame++;
                     total_size += encoded_len;
@@ -497,10 +495,10 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         HandleScope scope(Env());
         uint8_t *buf = (*data)->data;
         uint32_t size = (*data)->size;
-        uint32_t start_post = 0;
-        uint32_t len = size;
+        // uint32_t start_post = 0;
+        // uint32_t len = size;
         int nal_type = -1;
-        uint32_t last_pos = 0;
+        // uint32_t last_pos = 0;
         if (size > 4)
         {
             uint8_t prefix[4] = {0x00, 0x00, 0x00, 0x01};
@@ -514,7 +512,7 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
                 pos_vec.push_back((uint8_t *)(pos));
                 k = pos - buf + 4;
             }
-            for (int i = 0; i < pos_vec.size(); i++)
+            for (uint32_t i = 0; i < pos_vec.size(); i++)
             {
                 size_t len = i == pos_vec.size() - 1 ? size - (pos_vec[i] - buf) : pos_vec[i + 1] - pos_vec[i];
                 // Copy data to a new buffer to avoid data races, as the original buffer will be reused.
