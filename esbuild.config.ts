@@ -44,6 +44,6 @@ fs.copySync(`${outputPath}/types_tmp`, `${outputPath}/types`);
 // fs.copySync(`${outputPath}/types/src`, `${outputPath}/lib`);
 fs.rmSync(`${outputPath}/types_tmp`, { recursive: true });
 
-if (fs.existsSync('build/Release/encoder.node')) {
-  fs.copySync(`build/Release/encoder.node`, `${outputPath}/build/Release/encoder.node`);
+if (fs.existsSync('build/Release/h264_encoder.node')) {
+  fs.copySync(`build/Release/h264_encoder.node`, `${outputPath}/build/Release/h264_encoder.node`);
 }
