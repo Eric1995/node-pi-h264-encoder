@@ -83,7 +83,7 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     int fd = -1;
     FILE *file = NULL;
     bool stopped = false;
-    std::mutex mtx; // 互斥量，保护产品缓冲区
+    std::mutex operation_mutex; // 互斥量，保护 feed 和 stop 操作
     std::condition_variable frame_available;
 
     bool invoke_callback = true;
@@ -399,6 +399,9 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
 
     void feed(uint8_t *plane_data, uint32_t size)
     {
+        std::lock_guard<std::mutex> lock(operation_mutex);
+        if (stopped)
+            return;
         // uint32_t size = data.Get("size").As<Napi::Number>().Uint32Value();
         // uint8_t *plane_data = (uint8_t *)data.Get("data").As<Napi::ArrayBuffer>().Data();
         memcpy(output.start, plane_data, size);
@@ -407,6 +410,8 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
 
     void feed(int _fd, uint32_t size)
     {
+        std::lock_guard<std::mutex> lock(operation_mutex);
+
         if (stopped)
             return;
         v4l2_buffer buf = {};
@@ -438,6 +443,8 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
 
     void stop()
     {
+        std::lock_guard<std::mutex> lock(operation_mutex);
+
         if (stopped)
             return;
         stopped = true;
