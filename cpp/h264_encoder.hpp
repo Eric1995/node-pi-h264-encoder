@@ -4,7 +4,6 @@
 #include <fcntl.h>
 #include <iostream>
 #include <linux/videodev2.h>
-#include <list>
 #include <mutex>
 #include <napi.h>
 #include <optional>
@@ -26,14 +25,6 @@ struct frame_data_t
     uint8_t *data;
 };
 
-struct pending_frame_t
-{
-    // For V4L2_MEMORY_DMABUF
-    int fd = -1;
-    // For V4L2_MEMORY_MMAP
-    std::vector<uint8_t> data;
-    uint32_t size;
-};
 using FrameType = frame_data_t *;
 
 struct buffer
@@ -74,7 +65,7 @@ void map(int fd, uint32_t type, struct buffer *buffer, enum v4l2_memory mem_type
     if (buffer->start == (void *)-1)
     {
         // std::cout << "mmap type: " << type << std::endl;
-        throw std::runtime_error("mmap failed for buffer type " + std::to_string(type) + ": " + std::strerror(errno));
+        throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
     }
 }
 
@@ -89,15 +80,11 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     uint8_t num_planes = 1;
     struct buffer output;
     struct buffer capture;
-    int fd;
+    int fd = -1;
     FILE *file = NULL;
     bool stopped = false;
-
-    // Thread-safe queue for incoming frames
-    std::mutex queue_mtx;
-    std::condition_variable queue_cv;
-    std::list<pending_frame_t> frame_queue;
-    bool first_frame_fed = false;
+    std::mutex mtx; // 互斥量，保护产品缓冲区
+    std::condition_variable frame_available;
 
     bool invoke_callback = true;
     uint32_t total_frame = 0;
@@ -106,7 +93,6 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     uint32_t poll_num = 0;
 
     enum v4l2_memory output_mem_type = V4L2_MEMORY_DMABUF;
-    std::string init_error_msg;
 
     /**
      * 1: feed fd;
@@ -114,18 +100,15 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
      */
     uint8_t feed_type = 1;
 
-    EncoderWorker(Napi::Object option, Napi::Function callback) : AsyncProgressWorker(callback), queue_mtx(), queue_cv(), frame_queue()
+    EncoderWorker(Napi::Object option, Napi::Function callback) : AsyncProgressWorker(callback)
     {
-        // The rest of the constructor logic
-        // Defer opening and configuring the device until Execute,
-        // so that errors can be reported via OnError.
-        // But we can do some pre-checks here.
-        if ((fd = open("/dev/video11", O_RDWR)) < 0)
+        // Open device first, so we can clean it up in case of an error.
+        fd = open("/dev/video11", O_RDWR);
+        if (fd < 0)
         {
-            init_error_msg = std::string("failed to open video device /dev/video11: ") + std::strerror(errno);
+            // We can't throw here, as it would crash. We'll report error in Execute.
             return;
         }
-
         if (option.Get("width").IsNumber())
             width = option.Get("width").As<Napi::Number>().Uint32Value();
         if (option.Get("height").IsNumber())
@@ -162,45 +145,29 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         if (option.Get("controllers").IsArray())
         {
             Napi::Array controllers = option.Get("controllers").As<Napi::Array>();
-            for (uint32_t i = 0; i < controllers.Length(); i++)
+            for (int i = 0; i < controllers.Length(); i++)
             {
                 Napi::Object ctrl_obj = controllers.Get(i).As<Napi::Object>();
-                uint32_t id = ctrl_obj.Get("id").As<Napi::Number>().Uint32Value();
-                int32_t value = ctrl_obj.Get("value").As<Napi::Number>().Int32Value();
+                uint32_t id = ctrl_obj.Get('id').As<Napi::Number>().Uint32Value();
+                int32_t value = ctrl_obj.Get('value').As<Napi::Number>().Int32Value();
                 v4l2_control ctrl = {};
                 ctrl.id = id;
                 ctrl.value = value;
-                if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
-                {
-                    init_error_msg = "failed to set controller " + std::to_string(id);
-                    return;
-                }
+                ioctl(fd, VIDIOC_S_CTRL, &ctrl);
             }
         }
         // 设置码率
         v4l2_control ctrl = {};
         ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE;
         ctrl.value = bitrate_bps;
-        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
-        {
-            init_error_msg = "failed to set bitrate";
-            return;
-        }
+        ioctl(fd, VIDIOC_S_CTRL, &ctrl);
         ctrl.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
         ctrl.value = level;
-        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
-        {
-            init_error_msg = "failed to set level";
-            return;
-        }
+        ioctl(fd, VIDIOC_S_CTRL, &ctrl);
 
         struct v4l2_format fmt;
         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0)
-        {
-            init_error_msg = "failed to get output format (VIDIOC_G_FMT)";
-            return;
-        }
+        ioctl(fd, VIDIOC_G_FMT, &fmt);
         fmt.fmt.pix_mp.width = width;
         fmt.fmt.pix_mp.height = height;
         fmt.fmt.pix_mp.pixelformat = pixel_format;
@@ -210,19 +177,11 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             fmt.fmt.pix_mp.plane_fmt[0].bytesperline = option.Get("bytesperline").As<Napi::Number>().Uint32Value();
         if (option.Get("colorspace").IsNumber())
             fmt.fmt.pix_mp.colorspace = option.Get("colorspace").As<Napi::Number>().Uint32Value();
-        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
-        {
-            init_error_msg = "failed to set output format (VIDIOC_S_FMT)";
-            return;
-        }
+        ioctl(fd, VIDIOC_S_FMT, &fmt);
 
         fmt = {};
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0)
-        {
-            init_error_msg = "failed to get capture format (VIDIOC_G_FMT)";
-            return;
-        }
+        ioctl(fd, VIDIOC_G_FMT, &fmt);
         fmt.fmt.pix_mp.width = width;
         fmt.fmt.pix_mp.height = height;
         fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
@@ -231,11 +190,7 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         fmt.fmt.pix_mp.num_planes = 1;
         fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 0;
         fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 1024 << 10;
-        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
-        {
-            init_error_msg = "failed to set capture format (VIDIOC_S_FMT)";
-            return;
-        }
+        ioctl(fd, VIDIOC_S_FMT, &fmt);
 
         if (option.Get("framerate").IsNumber())
         {
@@ -245,11 +200,7 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             params.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
             params.parm.output.timeperframe.numerator = 1;
             params.parm.output.timeperframe.denominator = framerate;
-            if (ioctl(fd, VIDIOC_S_PARM, &params) < 0)
-            {
-                init_error_msg = "failed to set framerate (VIDIOC_S_PARM)";
-                return;
-            }
+            ioctl(fd, VIDIOC_S_PARM, &params);
         }
 
         struct v4l2_requestbuffers buf;
@@ -257,112 +208,42 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         // struct buffer output;
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         buf.memory = output_mem_type;
-        if (ioctl(fd, VIDIOC_REQBUFS, &buf) < 0)
-        {
-            init_error_msg = "failed to request output buffers (VIDIOC_REQBUFS)";
-            return;
-        }
+        ioctl(fd, VIDIOC_REQBUFS, &buf);
         if (feed_type == 2)
         {
-            try
-            {
-                map(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &output, output_mem_type);
-            }
-            catch (const std::runtime_error &e)
-            {
-                init_error_msg = e.what();
-                return;
-            }
+            map(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &output, output_mem_type);
         }
 
         // struct buffer capture;
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         buf.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(fd, VIDIOC_REQBUFS, &buf) < 0)
-        {
-            init_error_msg = "failed to request capture buffers (VIDIOC_REQBUFS)";
-            return;
-        }
-        try
-        {
-            map(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &capture, V4L2_MEMORY_MMAP);
-        }
-        catch (const std::runtime_error &e)
-        {
-            init_error_msg = e.what();
-            return;
-        }
+        ioctl(fd, VIDIOC_REQBUFS, &buf);
+        map(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &capture, V4L2_MEMORY_MMAP);
 
-        if (ioctl(fd, VIDIOC_QBUF, capture.inner) < 0)
-        {
-            init_error_msg = "failed to queue capture buffer (VIDIOC_QBUF)";
-            return;
-        }
+        ioctl(fd, VIDIOC_QBUF, capture.inner);
 
         int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0)
-        {
-            init_error_msg = "failed to start output stream (VIDIOC_STREAMON)";
-            return;
-        }
+        ioctl(fd, VIDIOC_STREAMON, &type);
 
         type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0)
-        {
-            init_error_msg = "failed to start capture stream (VIDIOC_STREAMON)";
-            return;
-        }
+        ioctl(fd, VIDIOC_STREAMON, &type);
     }
-
-    ~EncoderWorker() override = default;
 
     void Execute(const ExecutionProgress &progress)
     {
-        if (!init_error_msg.empty())
+        if (fd < 0)
         {
-            SetError(init_error_msg);
+            SetError("Failed to open /dev/video11: " + std::string(strerror(errno)));
             return;
         }
 
-        // The main loop starts here. First, we need to wait for the very first frame
-        // to be fed from the JS side.
-        {
-            std::unique_lock<std::mutex> lock(queue_mtx);
-            // Wait until the queue is not empty or the worker is stopped.
-            queue_cv.wait(lock, [this] { return stopped || !frame_queue.empty(); });
-
-            if (stopped)
-                return;
-
-            // Dequeue the first frame and feed it to the hardware.
-            pending_frame_t frame = std::move(frame_queue.front());
-            frame_queue.pop_front();
-            first_frame_fed = true;
-            lock.unlock();
-
-            try
-            {
-                if (feed_type == 1)
-                {
-                    feed_to_v4l2(frame.fd, frame.size);
-                }
-                else
-                {
-                    feed_to_v4l2(frame.data.data(), frame.size);
-                }
-            }
-            catch (const std::runtime_error &e)
-            {
-                SetError(e.what());
-                return;
-            }
-        }
         while (true)
         {
             if (stopped)
             {
                 break;
             }
+            // usleep(8 * 1000);
 
             pollfd p = {fd, POLLIN, 0};
             int ret = poll(&p, 1, 200);
@@ -386,63 +267,19 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
                 buf.m.planes = &out_planes;
                 // 将output buffer出列
                 buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-                if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0)
-                {
-                    // This can happen if we are stopping, so don't treat as a fatal error
-                    // SetError("failed to dequeue output buffer");
-                    // break;
-                }
-                else
-                {
-                    // The previous frame has been processed. Now feed the next one from our queue.
-                    std::unique_lock<std::mutex> lock(queue_mtx);
-                    // Wait until there is a new frame in the queue or we are stopped.
-                    queue_cv.wait(lock, [this] { return stopped || !frame_queue.empty(); });
-
-                    if (stopped)
-                    {
-                        lock.unlock();
-                        break;
-                    }
-
-                    // Dequeue the next frame and feed it.
-                    pending_frame_t frame = std::move(frame_queue.front());
-                    frame_queue.pop_front();
-                    lock.unlock();
-
-                    try
-                    {
-                        if (feed_type == 1)
-                        {
-                            feed_to_v4l2(frame.fd, frame.size);
-                        }
-                        else
-                        {
-                            feed_to_v4l2(frame.data.data(), frame.size);
-                        }
-                    }
-                    catch (const std::runtime_error &e)
-                    {
-                        SetError(e.what());
-                        break;
-                    }
-                }
+                ioctl(fd, VIDIOC_DQBUF, &buf);
                 // 将capture buffer出列
                 buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
                 buf.memory = V4L2_MEMORY_MMAP;
                 buf.length = 1;
                 memset(&out_planes, 0, sizeof(out_planes));
                 buf.m.planes = &out_planes;
-                if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0)
-                {
-                    SetError("failed to dequeue capture buffer");
-                    break;
-                }
+                ioctl(fd, VIDIOC_DQBUF, &buf);
                 // 提取capture buffer里的编码数据，即H264数据
                 uint32_t encoded_len = buf.m.planes[0].bytesused;
                 if (encoded_len > 0)
                 {
-                    // long long current = millis();
+                    long long current = millis();
                     // std::cout << fd << "--encoded frame: " << total_frame << " cost: " << current - feed_time << ", size: " << encoded_len / 1024.0 << std::endl;
                     total_frame++;
                     total_size += encoded_len;
@@ -474,18 +311,18 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         }
     }
 
-    void feed_to_v4l2(const uint8_t *plane_data, uint32_t size)
+    void feed(uint8_t *plane_data, uint32_t size)
     {
+        // uint32_t size = data.Get("size").As<Napi::Number>().Uint32Value();
+        // uint8_t *plane_data = (uint8_t *)data.Get("data").As<Napi::ArrayBuffer>().Data();
         memcpy(output.start, plane_data, size);
-        struct v4l2_buffer *buf_to_queue = &output.inner;
-        if (ioctl(fd, VIDIOC_QBUF, buf_to_queue) < 0)
-        {
-            throw std::runtime_error(std::string("failed to queue output buffer: ") + std::strerror(errno));
-        }
+        ioctl(fd, VIDIOC_QBUF, output.inner);
     }
 
-    void feed_to_v4l2(int _fd, uint32_t size)
+    void feed(int _fd, uint32_t size)
     {
+        if (stopped)
+            return;
         v4l2_buffer buf = {};
         v4l2_plane planes[VIDEO_MAX_PLANES] = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -497,39 +334,9 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         buf.m.planes[0].m.fd = _fd;
         buf.m.planes[0].bytesused = size;
         buf.m.planes[0].length = size;
-        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0)
-        {
-            if (_fd != -1)
-                close(_fd);
-            throw std::runtime_error(std::string("failed to queue dma buffer: ") + std::strerror(errno));
-        }
+        ioctl(fd, VIDIOC_QBUF, &buf);
         feed_time = millis();
-    }
-
-    void feed(uint8_t *plane_data, uint32_t size)
-    {
-        {
-            std::lock_guard<std::mutex> lock(queue_mtx);
-            // For MMAP, we must copy the data as the source buffer might be reused.
-            frame_queue.push_back({-1, std::vector<uint8_t>(plane_data, plane_data + size), size});
-        }
-        // Notify the worker thread that a new frame is available.
-        queue_cv.notify_one();
-    }
-
-    void feed(int _fd, uint32_t size)
-    {
-        if (stopped)
-        {
-            close(_fd); // Prevent fd leak if stopped
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(queue_mtx);
-            frame_queue.push_back({_fd, {}, size});
-        }
-        // Notify the worker thread that a new frame is available.
-        queue_cv.notify_one();
+        // std::cout << fd << "--feed frame: " << total_frame << " at: " << feed_time << std::endl;
     }
 
     int setController(Napi::Object ctrl_obj)
@@ -546,50 +353,39 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     void stop()
     {
         if (stopped)
-        {
             return;
-        }
         stopped = true;
 
-        // Clear any pending frame
-        queue_cv.notify_one(); // Wake up the worker thread if it's waiting
-        {
-            std::lock_guard<std::mutex> lock(queue_mtx);
-            for (const auto &frame : frame_queue)
-            {
-                if (frame.fd != -1)
-                    close(frame.fd);
-            }
-            frame_queue.clear();
-        }
-
-        // Unmap buffers
-        munmap(capture.start, capture.length);
-        if (feed_type == 2)
-        {
-            munmap(output.start, output.length);
-        }
-
         // usleep(2000 * 1000);
-        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        ioctl(fd, VIDIOC_STREAMOFF, &type);
-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(fd, VIDIOC_STREAMOFF, &type);
-        struct v4l2_requestbuffers buf;
-        buf.count = 0; // Request to free buffers
-        buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        buf.memory = output_mem_type;
-        ioctl(fd, VIDIOC_REQBUFS, &buf);
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(fd, VIDIOC_REQBUFS, &buf);
+        if (fd >= 0)
+        {
+            int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+            ioctl(fd, VIDIOC_STREAMOFF, &type);
+            type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            ioctl(fd, VIDIOC_STREAMOFF, &type);
 
-        close(fd);
+            // Unmap buffers
+            if (capture.start)
+                munmap(capture.start, capture.length);
+            if (output.start)
+                munmap(output.start, output.length);
+
+            struct v4l2_requestbuffers buf = {};
+            buf.count = 0; // Request to free buffers
+            buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+            buf.memory = output_mem_type;
+            ioctl(fd, VIDIOC_REQBUFS, &buf);
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            ioctl(fd, VIDIOC_REQBUFS, &buf);
+
+            close(fd);
+            fd = -1;
+        }
 
         if (file)
         {
             fclose(file);
-            file = NULL;
         }
         if (1)
         {
@@ -610,16 +406,17 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
     {
         if (Callback().IsEmpty() || !invoke_callback)
         {
-            delete *data; // Still need to free the memory even if not calling back
+            // IMPORTANT: Free the data even if we don't call back to JS.
+            delete *data;
             return;
         }
         HandleScope scope(Env());
         uint8_t *buf = (*data)->data;
         uint32_t size = (*data)->size;
-        // uint32_t start_post = 0;
-        // uint32_t len = size;
+        uint32_t start_post = 0;
+        uint32_t len = size;
         int nal_type = -1;
-        // uint32_t last_pos = 0;
+        uint32_t last_pos = 0;
         if (size > 4)
         {
             uint8_t prefix[4] = {0x00, 0x00, 0x00, 0x01};
@@ -633,18 +430,15 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
                 pos_vec.push_back((uint8_t *)(pos));
                 k = pos - buf + 4;
             }
-            for (uint32_t i = 0; i < pos_vec.size(); i++)
+            for (int i = 0; i < pos_vec.size(); i++)
             {
                 size_t len = i == pos_vec.size() - 1 ? size - (pos_vec[i] - buf) : pos_vec[i + 1] - pos_vec[i];
-                // Copy data to a new buffer to avoid data races, as the original buffer will be reused.
-                uint8_t *new_buf = new uint8_t[len];
-                memcpy(new_buf, pos_vec[i], len);
-
-                Napi::ArrayBuffer buffer = Napi::ArrayBuffer::New(Env(), new_buf, len, [](Napi::Env /*env*/, void *data) { delete[] static_cast<uint8_t *>(data); });
+                Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::Copy(Env(), pos_vec[i], len);
                 Napi::Object payload = Napi::Object::New(Env());
                 nal_type = (int)(pos_vec[i][4]) & 0x1f;
                 payload.Set("nalu", nal_type);
                 payload.Set("data", buffer);
+                std::cout << "nalu type: " << nal_type << ", size:  " << len << std::endl;
                 Callback().Call({Env().Null(), Env().Null(), payload});
             }
 
@@ -701,8 +495,9 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             //     i += skip_len;
             // }
         }
-
-        // Free the frame_data_t object allocated in Execute()
+        // Free the frame_data_t object allocated in Execute().
+        // The data pointer inside frame_data_t points to mmap'd memory and must not be freed.
+        // Only the container struct itself, which was allocated with `new`, should be deleted.
         delete *data;
     }
 };
@@ -712,16 +507,18 @@ class H264Encoder : public Napi::ObjectWrap<H264Encoder>
   public:
     static Napi::FunctionReference *constructor;
     EncoderWorker *worker;
+
     H264Encoder(const Napi::CallbackInfo &info) : Napi::ObjectWrap<H264Encoder>(info)
     {
         Napi::Object option = info[0].As<Napi::Object>();
         Napi::Function callback = info[1].As<Napi::Function>();
         Napi::HandleScope scope(info.Env());
         worker = new EncoderWorker(option, callback);
-        if (!worker->init_error_msg.empty())
+        // Check if constructor failed to open device
+        if (worker->fd < 0)
         {
-            std::string errMsg = worker->init_error_msg;
-            // The worker will be deleted by the ObjectWrap finalizer.
+            std::string errMsg = "Failed to open /dev/video11: " + std::string(strerror(errno));
+            delete worker; // Clean up the partially constructed worker
             worker = nullptr;
             Napi::Error::New(info.Env(), errMsg).ThrowAsJavaScriptException();
             return;
@@ -730,25 +527,17 @@ class H264Encoder : public Napi::ObjectWrap<H264Encoder>
     }
     Napi::Value feed(const Napi::CallbackInfo &info)
     {
-        Napi::Env env = info.Env();
-        try
+        Napi::Value param = info[0].As<Napi::Value>();
+        if (param.IsArrayBuffer())
         {
-            Napi::Value param = info[0].As<Napi::Value>();
-            if (param.IsArrayBuffer())
-            {
-                uint8_t *plane_data = (uint8_t *)param.As<Napi::ArrayBuffer>().Data();
-                worker->feed(plane_data, info[1].As<Napi::Number>().Uint32Value());
-            }
-            else if (param.IsNumber())
-            {
-                worker->feed(param.As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().Uint32Value());
-            }
+            uint8_t *plane_data = (uint8_t *)param.As<Napi::ArrayBuffer>().Data();
+            worker->feed(plane_data, info[1].As<Napi::Number>().Uint32Value());
         }
-        catch (const std::runtime_error &e)
+        else if (param.IsNumber())
         {
-            Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-            return env.Undefined();
+            worker->feed(param.As<Napi::Number>().Int32Value(), info[1].As<Napi::Number>().Uint32Value());
         }
+
         return Napi::Number::New(info.Env(), 0);
     }
 
