@@ -94,6 +94,8 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
 
     enum v4l2_memory output_mem_type = V4L2_MEMORY_DMABUF;
 
+    std::string init_error_msg;
+
     /**
      * 1: feed fd;
      * 2: feed buffer;
@@ -102,13 +104,6 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
 
     EncoderWorker(Napi::Object option, Napi::Function callback) : AsyncProgressWorker(callback)
     {
-        // Open device first, so we can clean it up in case of an error.
-        fd = open("/dev/video11", O_RDWR);
-        if (fd < 0)
-        {
-            // We can't throw here, as it would crash. We'll report error in Execute.
-            return;
-        }
         if (option.Get("width").IsNumber())
             width = option.Get("width").As<Napi::Number>().Uint32Value();
         if (option.Get("height").IsNumber())
@@ -123,8 +118,6 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             num_planes = option.Get("num_planes").As<Napi::Number>().Uint32Value();
         if (option.Get("invokeCallback").IsBoolean())
             invoke_callback = option.Get("invokeCallback").As<Napi::Boolean>();
-        if (option.Get("file").IsString())
-            file = fopen(option.Get("file").As<Napi::String>().Utf8Value().c_str(), "w");
         if (option.Get("feed_type").IsNumber())
         {
             auto _feed_type = option.Get("feed_type").As<Napi::Number>().Uint32Value();
@@ -142,6 +135,81 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             }
         }
 
+        // Defer all fallible initialization to a separate method.
+        // This allows us to handle errors gracefully and report them back to JS.
+        initialize(option);
+    }
+
+    // All initialization that can fail is performed here.
+    // On failure, it sets `init_error_msg` and cleans up any partially acquired resources.
+    void initialize(const Napi::Object &option)
+    {
+        // 1. Open device
+        fd = open("/dev/video11", O_RDWR);
+        if (fd < 0)
+        {
+            init_error_msg = "Failed to open /dev/video11: " + std::string(strerror(errno));
+            return;
+        }
+
+        // 2. Open output file if specified
+        if (option.Get("file").IsString())
+        {
+            file = fopen(option.Get("file").As<Napi::String>().Utf8Value().c_str(), "w");
+            if (!file)
+            {
+                init_error_msg = "Failed to open output file: " + std::string(strerror(errno));
+                close(fd);
+                fd = -1;
+                return;
+            }
+        }
+
+        // 3. Configure V4L2 device. Wrap in try-catch to handle errors from ioctl/mmap.
+        try
+        {
+            configure_v4l2(option);
+        }
+        catch (const std::runtime_error &e)
+        {
+            init_error_msg = e.what();
+            // Cleanup all resources acquired so far
+            if (file)
+            {
+                fclose(file);
+                file = nullptr;
+            }
+            if (output.start)
+            {
+                munmap(output.start, output.length);
+                output.start = nullptr;
+            }
+            if (capture.start)
+            {
+                munmap(capture.start, capture.length);
+                capture.start = nullptr;
+            }
+            if (fd >= 0)
+            {
+                // Request to free buffers before closing fd
+                struct v4l2_requestbuffers buf_req = {};
+                buf_req.count = 0;
+                buf_req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+                buf_req.memory = output_mem_type;
+                ioctl(fd, VIDIOC_REQBUFS, &buf_req);
+                buf_req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                buf_req.memory = V4L2_MEMORY_MMAP;
+                ioctl(fd, VIDIOC_REQBUFS, &buf_req);
+
+                close(fd);
+                fd = -1;
+            }
+            return;
+        }
+    }
+
+    void configure_v4l2(const Napi::Object &option)
+    {
         if (option.Get("controllers").IsArray())
         {
             Napi::Array controllers = option.Get("controllers").As<Napi::Array>();
@@ -153,21 +221,27 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
                 v4l2_control ctrl = {};
                 ctrl.id = id;
                 ctrl.value = value;
-                ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+                if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+                    throw std::runtime_error("Failed to set controller " + std::to_string(id) + ": " + strerror(errno));
             }
         }
         // 设置码率
         v4l2_control ctrl = {};
         ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE;
         ctrl.value = bitrate_bps;
-        ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+            throw std::runtime_error("Failed to set bitrate: " + std::string(strerror(errno)));
+
         ctrl.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
         ctrl.value = level;
-        ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+            throw std::runtime_error("Failed to set H.264 level: " + std::string(strerror(errno)));
 
         struct v4l2_format fmt;
         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        ioctl(fd, VIDIOC_G_FMT, &fmt);
+        if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0)
+            throw std::runtime_error("Failed to get output format (VIDIOC_G_FMT): " + std::string(strerror(errno)));
+
         fmt.fmt.pix_mp.width = width;
         fmt.fmt.pix_mp.height = height;
         fmt.fmt.pix_mp.pixelformat = pixel_format;
@@ -177,11 +251,14 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             fmt.fmt.pix_mp.plane_fmt[0].bytesperline = option.Get("bytesperline").As<Napi::Number>().Uint32Value();
         if (option.Get("colorspace").IsNumber())
             fmt.fmt.pix_mp.colorspace = option.Get("colorspace").As<Napi::Number>().Uint32Value();
-        ioctl(fd, VIDIOC_S_FMT, &fmt);
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+            throw std::runtime_error("Failed to set output format (VIDIOC_S_FMT): " + std::string(strerror(errno)));
 
         fmt = {};
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(fd, VIDIOC_G_FMT, &fmt);
+        if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0)
+            throw std::runtime_error("Failed to get capture format (VIDIOC_G_FMT): " + std::string(strerror(errno)));
+
         fmt.fmt.pix_mp.width = width;
         fmt.fmt.pix_mp.height = height;
         fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
@@ -190,7 +267,8 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         fmt.fmt.pix_mp.num_planes = 1;
         fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 0;
         fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 1024 << 10;
-        ioctl(fd, VIDIOC_S_FMT, &fmt);
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+            throw std::runtime_error("Failed to set capture format (VIDIOC_S_FMT): " + std::string(strerror(errno)));
 
         if (option.Get("framerate").IsNumber())
         {
@@ -200,7 +278,8 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
             params.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
             params.parm.output.timeperframe.numerator = 1;
             params.parm.output.timeperframe.denominator = framerate;
-            ioctl(fd, VIDIOC_S_PARM, &params);
+            if (ioctl(fd, VIDIOC_S_PARM, &params) < 0)
+                throw std::runtime_error("Failed to set framerate: " + std::string(strerror(errno)));
         }
 
         struct v4l2_requestbuffers buf;
@@ -208,32 +287,39 @@ class EncoderWorker : public AsyncProgressWorker<FrameType>
         // struct buffer output;
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         buf.memory = output_mem_type;
-        ioctl(fd, VIDIOC_REQBUFS, &buf);
+        if (ioctl(fd, VIDIOC_REQBUFS, &buf) < 0)
+            throw std::runtime_error("Failed to request output buffers: " + std::string(strerror(errno)));
+
         if (feed_type == 2)
         {
             map(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &output, output_mem_type);
         }
 
-        // struct buffer capture;
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         buf.memory = V4L2_MEMORY_MMAP;
-        ioctl(fd, VIDIOC_REQBUFS, &buf);
+        if (ioctl(fd, VIDIOC_REQBUFS, &buf) < 0)
+            throw std::runtime_error("Failed to request capture buffers: " + std::string(strerror(errno)));
+
         map(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &capture, V4L2_MEMORY_MMAP);
 
-        ioctl(fd, VIDIOC_QBUF, capture.inner);
+        if (ioctl(fd, VIDIOC_QBUF, &capture.inner) < 0)
+            throw std::runtime_error("Failed to queue initial capture buffer: " + std::string(strerror(errno)));
 
         int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        ioctl(fd, VIDIOC_STREAMON, &type);
+        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0)
+            throw std::runtime_error("Failed to start output stream: " + std::string(strerror(errno)));
 
         type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(fd, VIDIOC_STREAMON, &type);
+        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0)
+            throw std::runtime_error("Failed to start capture stream: " + std::string(strerror(errno)));
     }
 
     void Execute(const ExecutionProgress &progress)
     {
-        if (fd < 0)
+        // If initialization failed, report the error and exit the worker thread.
+        if (!init_error_msg.empty())
         {
-            SetError("Failed to open /dev/video11: " + std::string(strerror(errno)));
+            SetError(init_error_msg);
             return;
         }
 
@@ -514,16 +600,28 @@ class H264Encoder : public Napi::ObjectWrap<H264Encoder>
         Napi::Function callback = info[1].As<Napi::Function>();
         Napi::HandleScope scope(info.Env());
         worker = new EncoderWorker(option, callback);
-        // Check if constructor failed to open device
-        if (worker->fd < 0)
+        // Check if initialization failed inside the worker's constructor
+        if (!worker->init_error_msg.empty())
         {
-            std::string errMsg = "Failed to open /dev/video11: " + std::string(strerror(errno));
+            std::string errMsg = worker->init_error_msg;
+            // The worker itself will be cleaned up by the ObjectWrap finalizer,
+            // but we must not queue it.
             delete worker; // Clean up the partially constructed worker
             worker = nullptr;
             Napi::Error::New(info.Env(), errMsg).ThrowAsJavaScriptException();
             return;
         }
         worker->Queue();
+    }
+
+    ~H264Encoder()
+    {
+        if (worker)
+        {
+            // The worker is an AsyncWorker, N-API will delete it.
+            // However, we must ensure stop() is called to release V4L2 resources.
+            worker->stop();
+        }
     }
     Napi::Value feed(const Napi::CallbackInfo &info)
     {
